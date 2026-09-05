@@ -13,15 +13,17 @@ Wi-Fi 同步，USB 模式使用数据线直连。
 
 ## 许可
 
-本项目采用 GNU General Public License version 3（GPLv3）发布，允许个人和商业使用、
-修改与分发。分发修改版本时必须提供对应源代码、保留版权和许可证声明，并继续以
-GPLv3 授权。完整条款见 [LICENSE](LICENSE)。
+本项目采用 iUsbBridge 非商业使用许可：个人、学习、研究和其他非商业用途可永久、
+无限制使用、修改和分发；任何商业用途必须事先联系作者取得单独许可。再发布时必须
+保留作者署名和项目链接。完整条款见 [LICENSE](LICENSE)。
 
 版权所有 (c) 2026 RayrenSX
 
 项目地址：https://github.com/RayrenSX/iUsbBridge
 
-商业咨询：renxiang080104@gmail.com
+商业许可联系：renxiang080104@gmail.com
+
+本协议属于源码公开许可，不是 OSI 定义的严格开源许可证。
 
 ## 系统要求
 
