@@ -11,8 +11,9 @@ internal static class Program
     {
         ApplicationConfiguration.Initialize();
         var bridgePath = ResolveBridge(args);
-        using var bridge = new TouchBridge(bridgePath);
-        using var form = new TouchForm(bridge, Path.GetFileName(bridgePath));
+        TouchForm? form = null;
+        using var bridge = new TouchBridge(bridgePath, message => form?.SetStatus(message));
+        form = new TouchForm(bridge, Path.GetFileName(bridgePath));
         form.ShowDialog();
     }
 
@@ -31,10 +32,13 @@ internal sealed class TouchBridge : IDisposable
 {
     private readonly Process _process;
     private readonly Stream _input;
+    private readonly Action<string> _status;
+    private volatile bool _ready;
     private long _sequence;
 
-    public TouchBridge(string executable)
+    public TouchBridge(string executable, Action<string> status)
     {
+        _status = status;
         _process = new Process
         {
             StartInfo = new ProcessStartInfo
@@ -53,13 +57,17 @@ internal sealed class TouchBridge : IDisposable
         };
         if (!_process.Start()) throw new InvalidOperationException("Could not start the USB touch bridge.");
         _input = _process.StandardInput.BaseStream;
-        _ = DrainAsync(_process.StandardOutput);
+        _ = ReadEventsAsync(_process.StandardOutput);
         _ = DrainAsync(_process.StandardError);
     }
 
     public void Send(string phase, double x, double y)
     {
-        if (_process.HasExited) return;
+        if (_process.HasExited || !_ready)
+        {
+            _status("正在连接 iPhone/iPad，请等待状态变为“已就绪”...");
+            return;
+        }
         var message = JsonSerializer.SerializeToUtf8Bytes(new
         {
             schema = "iphoneMirror.touch.v2",
@@ -75,9 +83,30 @@ internal sealed class TouchBridge : IDisposable
         _input.Flush();
     }
 
-    private static async Task DrainAsync(StreamReader reader)
+    private async Task ReadEventsAsync(StreamReader reader)
     {
-        try { while (await reader.ReadLineAsync().ConfigureAwait(false) is not null) { } }
+        try
+        {
+            while (await reader.ReadLineAsync().ConfigureAwait(false) is { } line)
+            {
+                try
+                {
+                    using var json = JsonDocument.Parse(line);
+                    var root = json.RootElement;
+                    var kind = root.TryGetProperty("event", out var eventProp) ? eventProp.GetString() : null;
+                    var code = root.TryGetProperty("code", out var codeProp) ? codeProp.GetString() : null;
+                    if (kind == "ready")
+                    {
+                        _ready = true;
+                        _status("已就绪，可以在窗口内点击或拖动控制设备");
+                    }
+                    else if (kind == "error") _status("桥接器错误：" + (root.TryGetProperty("message", out var msg) ? msg.GetString() : code));
+                    else if (kind == "status") _status("连接状态：" + (code ?? "working"));
+                    else if (kind == "warning") _status("提示：" + (root.TryGetProperty("message", out var warning) ? warning.GetString() : code));
+                }
+                catch (JsonException) { }
+            }
+        }
         catch (ObjectDisposedException) { }
     }
 
@@ -123,6 +152,13 @@ internal sealed class TouchForm : Form
         MouseMove += OnMouseMove;
         MouseUp += OnMouseUp;
         FormClosed += (_, _) => { if (_pressed) _bridge.Send("up", 0.5, 0.5); };
+    }
+
+    public void SetStatus(string text)
+    {
+        if (IsDisposed) return;
+        if (InvokeRequired) BeginInvoke(() => SetStatus(text));
+        else _status.Text = text;
     }
 
     private (double X, double Y) Normalize(Point point)
