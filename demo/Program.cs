@@ -110,6 +110,12 @@ internal sealed class TouchBridge : IDisposable
         catch (ObjectDisposedException) { }
     }
 
+    private static async Task DrainAsync(StreamReader reader)
+    {
+        try { while (await reader.ReadLineAsync().ConfigureAwait(false) is not null) { } }
+        catch (ObjectDisposedException) { }
+    }
+
     public void Dispose()
     {
         try { _input.Dispose(); } catch { }
