@@ -1,4 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
+import importlib.util
 import sys
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files, copy_metadata
 
@@ -18,6 +19,18 @@ hiddenimports += collect_submodules('pmd_net_addr')
 hiddenimports += collect_submodules('pmd_pytcp')
 hiddenimports += collect_submodules('pytun_pmd3')
 
+
+def existing_modules(module_names):
+    """Keep optional import names out of PyInstaller's missing-import log."""
+    result = []
+    for module_name in module_names:
+        try:
+            if importlib.util.find_spec(module_name) is not None:
+                result.append(module_name)
+        except (ImportError, AttributeError, ModuleNotFoundError, ValueError):
+            pass
+    return result
+
 hiddenimports += [
     'pymobiledevice3.remote.userspace_tunnel',
     'pymobiledevice3.remote.tunnel_service',
@@ -36,6 +49,7 @@ hiddenimports += [
     'pytun_pmd3',
     'pytun_pmd3.wintun',
 ]
+hiddenimports = existing_modules(hiddenimports)
 
 datas = []
 datas += collect_data_files('pymobiledevice3')
