@@ -1985,13 +1985,21 @@ class TouchSession:
                     async with self._pasteboard_lock:
                         async with PasteboardService(self.rsd) as pasteboard:
                             text = await pasteboard.get_text()
-                    # Do not erase the Windows clipboard for an empty or
-                    # non-text device pasteboard; sync useful text only.
-                    if isinstance(text, str) and text and text != last_text:
-                        last_text = text
+                    # Keep an empty text pasteboard as a real state so the
+                    # host-side Shift+V cache cannot retain stale content.
+                    # The host decides separately whether an empty value may
+                    # replace the Windows clipboard.
+                    if isinstance(text, str):
+                        normalized_text = text
+                    elif text is None:
+                        normalized_text = ''
+                    else:
+                        normalized_text = None
+                    if normalized_text is not None and normalized_text != last_text:
+                        last_text = normalized_text
                         await self.ipc.emit({
                             'event': 'clipboard_text',
-                            'text': text,
+                            'text': normalized_text,
                         })
                 except Exception as error:
                     log.debug('device pasteboard poll failed: %s', error)
