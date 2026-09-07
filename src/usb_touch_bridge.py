@@ -1990,9 +1990,18 @@ class TouchSession:
             raise RuntimeError('pasteboard service is unavailable')
         async with PasteboardService(self.rsd) as pasteboard:
             await pasteboard.set_text(text)
-        timestamp = time.monotonic_ns() & ((1 << 48) - 1)
-        await self._apply_keyboard({}, timestamp, [0xE3, 0x19])
-        await self._apply_keyboard({}, timestamp, [])
+        # The HID service exposes a full pressed-key bitmap. If Command and V
+        # arrive in the same report, iOS may dispatch V before it observes the
+        # Command modifier and inserts a literal "v". Keep the modifier held
+        # across separate reports, matching a physical keyboard chord.
+        await asyncio.sleep(0.15)
+        await self._apply_keyboard({}, None, [0xE3])
+        await asyncio.sleep(0.06)
+        await self._apply_keyboard({}, None, [0xE3, 0x19])
+        await asyncio.sleep(0.08)
+        await self._apply_keyboard({}, None, [0xE3])
+        await asyncio.sleep(0.06)
+        await self._apply_keyboard({}, None, [])
 
     async def _apply_button(self, usage_page: int, usage_code: int, state: str) -> None:
         if self.indigo is None:
