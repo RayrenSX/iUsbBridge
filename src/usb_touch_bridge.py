@@ -78,6 +78,7 @@ from pymobiledevice3.remote.tunnel_service import (
     get_remote_pairing_tunnel_services,
 )
 from pymobiledevice3.remote.core_device.display_service import DisplayService
+from pymobiledevice3.remote.core_device.pasteboard_service import PasteboardService
 from pymobiledevice3.remote.core_device.hid_service import (
     UniversalHIDServiceService,
     IndigoHIDService,
@@ -101,11 +102,12 @@ log = logging.getLogger('iphoneMirror.usb_touch')
 PROTOCOL_VERSION = 2
 CAPABILITIES = ['iphoneMirror.usb_touch.v2', 'iphoneMirror.usb_keyboard.v1']
 MAX_SLOTS = 5
-MAX_FRAME_SIZE = 64 * 1024
+MAX_FRAME_SIZE = 4 * 1024 * 1024
 MESSAGE_SCHEMA = 'iphoneMirror.touch.v2'
 MESSAGE_KIND = 'touch_batch'
 VALID_ACTIONS = frozenset(('down', 'move', 'up'))
 KEYBOARD_MESSAGE_KIND = 'keyboard_batch'
+PASTE_TEXT_MESSAGE_KIND = 'paste_text'
 BUTTON_MESSAGE_KIND = 'button_event'
 BUTTON_STATES = frozenset(('down', 'up', 'canceled'))
 LEGACY_UNIVERSAL_HID_SERVICE = 'com.apple.coredevice.hid.universalhid'
@@ -1150,6 +1152,7 @@ class TouchSession:
         self.transport = None
         self.auth_mode: Optional[str] = None
         self.gate_open = False
+        self._owns_hid = False
         self._ddi_was_mounted = False
         self._ddi_refresh_attempted = False
         self._remote_pairing_provision_attempted = False
@@ -1745,6 +1748,7 @@ class TouchSession:
                 continue
 
             self.hid = hid
+            self._owns_hid = True
             await self.ipc.emit({'event': 'status', 'code': 'hid_service_selected',
                                  'message': hid.SERVICE_NAME})
             return
@@ -1947,6 +1951,11 @@ class TouchSession:
                 if frame.get('kind') == KEYBOARD_MESSAGE_KIND:
                     _, ts, usages = decode_keyboard_batch(frame)
                     await self._apply_keyboard(frame, ts, usages)
+                elif frame.get('kind') == PASTE_TEXT_MESSAGE_KIND:
+                    text = frame.get('text')
+                    if not isinstance(text, str):
+                        raise ValueError('paste text must be a string')
+                    await self._apply_paste_text(text)
                 elif frame.get('kind') == BUTTON_MESSAGE_KIND:
                     _, page, code, state = decode_button_event(frame)
                     await self._apply_button(page, code, state)
@@ -1975,6 +1984,15 @@ class TouchSession:
         # send_keyboard builds the report using the active pymobiledevice3
         # implementation and addresses the registered service consistently.
         await self.hid.send_keyboard(self.keyboard_service_id, usages, timestamp)
+
+    async def _apply_paste_text(self, text: str) -> None:
+        if self.rsd is None:
+            raise RuntimeError('pasteboard service is unavailable')
+        async with PasteboardService(self.rsd) as pasteboard:
+            await pasteboard.set_text(text)
+        timestamp = time.monotonic_ns() & ((1 << 48) - 1)
+        await self._apply_keyboard({}, timestamp, [0xE3, 0x19])
+        await self._apply_keyboard({}, timestamp, [])
 
     async def _apply_button(self, usage_page: int, usage_code: int, state: str) -> None:
         if self.indigo is None:
@@ -2025,16 +2043,18 @@ class TouchSession:
             except Exception:
                 pass
             self.indigo = None
+        if self.hid is not None:
             try:
                 for slot in range(MAX_SLOTS):
                     report = build_touchscreen_report(slot, TOUCHSCREEN_STATE_RELEASE, 0, 0)
                     await self.hid.send_report(DIGITIZER_SURFACE_MAIN_TOUCHSCREEN, report)
             except Exception:
                 pass
-            try:
-                await self.hid.__aexit__(None, None, None)
-            except Exception:
-                pass
+            if self._owns_hid:
+                try:
+                    await self.hid.__aexit__(None, None, None)
+                except Exception:
+                    pass
         if self.drain_task is not None:
             self.drain_task.cancel()
             try:
@@ -2075,6 +2095,7 @@ class TouchSession:
             except Exception:
                 pass
         self.hid = None
+        self._owns_hid = False
         self.rsd = None
         self.display = None
         self.dial_plane = None
