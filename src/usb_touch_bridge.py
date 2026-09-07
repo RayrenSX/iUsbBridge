@@ -56,6 +56,8 @@ from pymobiledevice3.exceptions import (
     ConnectionTerminatedError,
     DeveloperModeIsNotEnabledError,
     DeviceNotFoundError,
+    GetProhibitedError,
+    InvalidServiceError,
     MissingValueError,
     MuxException,
     NotMountedError,
@@ -1257,7 +1259,7 @@ class TouchSession:
             # current iOS releases the supported wireless CoreDevice route is
             # RemotePairing over mDNS, so try it when that legacy record is
             # absent instead of silently changing to the USB path.
-            await self._connect_wireless_via_remote_pairing()
+            await self._connect_via_remote_pairing()
             return
         try:
             await self._connect_with_ddi_recovery(lockdown)
@@ -1350,8 +1352,8 @@ class TouchSession:
         if last_error is not None:
             raise last_error
 
-    async def _connect_wireless_via_remote_pairing(self) -> None:
-        """Use the iOS RemotePairing route when Network usbmux is unavailable."""
+    async def _connect_via_remote_pairing(self) -> None:
+        """Use RemotePairing when usbmux cannot provide a CoreDevice tunnel."""
         if not self.udid:
             raise BridgePrerequisiteError(
                 'wireless_remote_pairing_required',
@@ -1438,6 +1440,16 @@ class TouchSession:
         await self._emit_status('checking_developer_environment')
         try:
             developer_mode_enabled = await lockdown.get_developer_mode_status()
+        except (GetProhibitedError, NotPairedError) as error:
+            # Lockdown reports GetProhibited when the host has not completed
+            # the device trust handshake. Do not mislabel that as Developer
+            # Mode being disabled; the WPF host already has a precise trust
+            # recovery message for this stable error code.
+            raise BridgePrerequisiteError(
+                'apple_device_not_trusted',
+                'The iPhone has not trusted this Windows host. Unlock the device '
+                'and tap Trust, then reconnect the USB cable.',
+            ) from error
         except Exception as error:
             raise BridgePrerequisiteError(
                 'developer_mode_check_failed',
@@ -1638,7 +1650,22 @@ class TouchSession:
             self._remote_pairing_provision_attempted = True
             await self._provision_remote_pairing(lockdown)
         await self._preflight_developer_environment(lockdown)
-        service = await CoreDeviceTunnelProxy.create(lockdown)
+        try:
+            service = await CoreDeviceTunnelProxy.create(lockdown)
+        except InvalidServiceError as error:
+            # iOS 17.0-17.3 does not expose CoreDeviceProxy over lockdown.
+            # The supported root-free route on those releases is the same
+            # RemotePairing tunnel used by explicit wireless control.
+            await self.ipc.emit({
+                'event': 'warning',
+                'code': 'coredevice_proxy_unavailable',
+                'message': (
+                    'CoreDeviceProxy is unavailable; falling back to the '
+                    f'RemotePairing tunnel: {str(error)[:180]}'
+                ),
+            })
+            await self._connect_via_remote_pairing()
+            return
         async with start_tunnel(service, protocol=TunnelProtocol.TCP) as tunnel_result:
             await self._connect_with_tunnel_result(tunnel_result)
 
