@@ -115,6 +115,7 @@ LOCKDOWN_CONNECT_ATTEMPTS = 4
 LOCKDOWN_RETRY_DELAY_SECONDS = 0.35
 CAPTURE_MUX_START_ATTEMPTS = 3
 CAPTURE_MUX_RETRY_DELAY_SECONDS = 0.75
+PASTEBOARD_POLL_INTERVAL_SECONDS = 0.8
 LOCKDOWN_RETRYABLE_ERRORS = (
     BadDevError,
     ConnectionFailedError,
@@ -1159,6 +1160,7 @@ class TouchSession:
         self._usb_mux_transport = None
         self._usb_mux_server = None
         self._usb_mux_previous_env: Optional[str] = None
+        self._pasteboard_lock = asyncio.Lock()
 
     async def _start_capture_mux(self) -> None:
         """Prefer the active QuickTime configuration without making it fatal.
@@ -1946,26 +1948,58 @@ class TouchSession:
 
     async def _serve(self) -> None:
         sm = FiveSlotStateMachine()
-        async for frame in self.ipc.read_messages():
-            try:
-                if frame.get('kind') == KEYBOARD_MESSAGE_KIND:
-                    _, ts, usages = decode_keyboard_batch(frame)
-                    await self._apply_keyboard(frame, ts, usages)
-                elif frame.get('kind') == PASTE_TEXT_MESSAGE_KIND:
-                    text = frame.get('text')
-                    if not isinstance(text, str):
-                        raise ValueError('paste text must be a string')
-                    await self._apply_paste_text(text)
-                elif frame.get('kind') == BUTTON_MESSAGE_KIND:
-                    _, page, code, state = decode_button_event(frame)
-                    await self._apply_button(page, code, state)
-                else:
-                    _, _, points = decode_touch_batch(frame)
-                    await self._apply_frame(sm, frame, points)
-            except Exception as e:
-                await self.ipc.emit({'event': 'error', 'code': 'send_failed',
-                                     'message': f'{type(e).__name__}: {str(e)[:200]}'})
-                break
+        pasteboard_task = asyncio.create_task(self._poll_device_pasteboard())
+        try:
+            async for frame in self.ipc.read_messages():
+                try:
+                    if frame.get('kind') == KEYBOARD_MESSAGE_KIND:
+                        _, ts, usages = decode_keyboard_batch(frame)
+                        await self._apply_keyboard(frame, ts, usages)
+                    elif frame.get('kind') == PASTE_TEXT_MESSAGE_KIND:
+                        text = frame.get('text')
+                        if not isinstance(text, str):
+                            raise ValueError('paste text must be a string')
+                        await self._apply_paste_text(text)
+                    elif frame.get('kind') == BUTTON_MESSAGE_KIND:
+                        _, page, code, state = decode_button_event(frame)
+                        await self._apply_button(page, code, state)
+                    else:
+                        _, _, points = decode_touch_batch(frame)
+                        await self._apply_frame(sm, frame, points)
+                except Exception as e:
+                    await self.ipc.emit({'event': 'error', 'code': 'send_failed',
+                                         'message': f'{type(e).__name__}: {str(e)[:200]}'})
+                    break
+        finally:
+            pasteboard_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pasteboard_task
+
+    async def _poll_device_pasteboard(self) -> None:
+        if self.rsd is None:
+            return
+        last_text = object()
+        try:
+            while True:
+                try:
+                    async with self._pasteboard_lock:
+                        async with PasteboardService(self.rsd) as pasteboard:
+                            text = await pasteboard.get_text()
+                    # Do not erase the Windows clipboard for an empty or
+                    # non-text device pasteboard; sync useful text only.
+                    if isinstance(text, str) and text and text != last_text:
+                        last_text = text
+                        await self.ipc.emit({
+                            'event': 'clipboard_text',
+                            'text': text,
+                        })
+                except Exception as error:
+                    log.debug('device pasteboard poll failed: %s', error)
+                await asyncio.sleep(PASTEBOARD_POLL_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log.debug('device pasteboard monitor unavailable: %s', error)
 
     async def _apply_keyboard(self, frame: dict, timestamp: Optional[int], usages: list[int]) -> None:
         if timestamp is not None:
@@ -1988,8 +2022,9 @@ class TouchSession:
     async def _apply_paste_text(self, text: str) -> None:
         if self.rsd is None:
             raise RuntimeError('pasteboard service is unavailable')
-        async with PasteboardService(self.rsd) as pasteboard:
-            await pasteboard.set_text(text)
+        async with self._pasteboard_lock:
+            async with PasteboardService(self.rsd) as pasteboard:
+                await pasteboard.set_text(text)
         # The HID service exposes a full pressed-key bitmap. If Command and V
         # arrive in the same report, iOS may dispatch V before it observes the
         # Command modifier and inserts a literal "v". Keep the modifier held
