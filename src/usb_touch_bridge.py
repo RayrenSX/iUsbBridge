@@ -2101,7 +2101,7 @@ class TouchSession:
                 await asyncio.sleep(0.06)
             finally:
                 if command_pressed:
-                    with contextlib.suppress(Exception):
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
                         await self._send_keyboard_report([])
 
     async def _apply_button(self, usage_page: int, usage_code: int, state: str) -> None:
