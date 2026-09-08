@@ -363,6 +363,7 @@ class UsbMuxTransport:
         self.mux = MuxDevice(self._write, wmax_packet=self._ep_out.wMaxPacketSize or 512, serial=serial)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._closed = False
         self.bytes_in = 0
         self.bytes_out = 0
         logger.info("usbmux interface %d claimed: IN=0x%02x OUT=0x%02x", intf.bInterfaceNumber,
@@ -401,11 +402,26 @@ class UsbMuxTransport:
     def close(self) -> None:
         import usb.util
 
+        if self._closed:
+            return
+        self._closed = True
+
         self.mux.close_all()
         self._stop.set()
         if self._thread:
-            self._thread.join(timeout=self.timeout_ms / 1000 + 1)
+            # Do not release the interface while libusb still has an in-flight
+            # bulk IN transfer. On libusb0/Windows that can leave the device
+            # claimed after process exit and break the next VERSION handshake.
+            self._thread.join(timeout=self.timeout_ms / 1000 + 3)
+            if self._thread.is_alive():
+                logger.warning("usbmux reader thread did not exit; skipping interface release")
+                return
         try:
             usb.util.release_interface(self.dev, self._intf.bInterfaceNumber)
+            logger.info("usbmux interface %d released", self._intf.bInterfaceNumber)
         except Exception as exc:  # noqa: BLE001
             logger.debug("release usbmux interface: %s", exc)
+        try:
+            usb.util.dispose_resources(self.dev)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("dispose usbmux resources: %s", exc)

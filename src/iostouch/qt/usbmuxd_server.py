@@ -65,6 +65,7 @@ class UsbmuxdServer:
         self.pair_records: dict[str, bytes] = pair_records if pair_records is not None else {}
         self.buid = _read_system_buid()
         self._server: Optional[asyncio.AbstractServer] = None
+        self._clients: set[asyncio.StreamWriter] = set()
         self._listeners: set[asyncio.StreamWriter] = set()
         self.connections = 0
 
@@ -86,6 +87,18 @@ class UsbmuxdServer:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+        # Close clients before the USB transport is released. Otherwise a
+        # Lockdown/CoreDevice tunnel may still be driving the mux connection
+        # while the next reverse-control process tries to claim the interface.
+        clients = list(self._clients | self._listeners)
+        self._clients.clear()
+        self._listeners.clear()
+        for writer in clients:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     @property
     def address(self) -> str:
@@ -126,6 +139,7 @@ class UsbmuxdServer:
     # ---------------------------------------------------------------- client handling
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
+        self._clients.add(writer)
         logger.info("usbmuxd: client connected from %s", peer)
         try:
             while True:
@@ -165,6 +179,7 @@ class UsbmuxdServer:
         except Exception:  # noqa: BLE001
             logger.exception("usbmuxd client %s failed", peer)
         finally:
+            self._clients.discard(writer)
             self._listeners.discard(writer)
             with _suppress():
                 writer.close()

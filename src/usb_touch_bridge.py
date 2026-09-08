@@ -2082,6 +2082,24 @@ class TouchSession:
                 await self.hid.send_report(DIGITIZER_SURFACE_MAIN_TOUCHSCREEN, report)
 
     async def _cleanup(self) -> None:
+        # Release the capture usbmux before closing the longer-lived CoreDevice
+        # scopes below.  The host gives the bridge a bounded shutdown window;
+        # leaving the claimed interface until the end makes an immediate
+        # second reverse-control start race the old process teardown.
+        if self._usb_mux_server is not None:
+            with contextlib.suppress(Exception):
+                self._usb_mux_server.stop()
+            self._usb_mux_server = None
+        if self._usb_mux_transport is not None:
+            with contextlib.suppress(Exception):
+                self._usb_mux_transport.close()
+            self._usb_mux_transport = None
+        if self._usb_mux_previous_env is None:
+            os.environ.pop('USBMUXD_SOCKET_ADDRESS', None)
+        else:
+            os.environ['USBMUXD_SOCKET_ADDRESS'] = self._usb_mux_previous_env
+        self._usb_mux_previous_env = None
+
         # 强制释放所有触点（异常清理）
         if self.hid is not None:
             try:
@@ -2154,19 +2172,6 @@ class TouchSession:
         self.stream_answer = None
         self.drain_task = None
         self.transport = None
-        if self._usb_mux_server is not None:
-            with contextlib.suppress(Exception):
-                self._usb_mux_server.stop()
-            self._usb_mux_server = None
-        if self._usb_mux_transport is not None:
-            with contextlib.suppress(Exception):
-                self._usb_mux_transport.close()
-            self._usb_mux_transport = None
-        if self._usb_mux_previous_env is None:
-            os.environ.pop('USBMUXD_SOCKET_ADDRESS', None)
-        else:
-            os.environ['USBMUXD_SOCKET_ADDRESS'] = self._usb_mux_previous_env
-        self._usb_mux_previous_env = None
         self.gate_open = False
         self.auth_mode = None
 
