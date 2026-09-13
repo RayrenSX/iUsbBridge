@@ -62,7 +62,7 @@ stderr。
 `status/downloading_developer_image` → `status/initializing_touch` → `ready`。设备必须
 开启开发者模式；若未挂载 DDI，桥接器会从 GitHub 官方 API 动态解析当前 commit 的 DDI
 文件清单，校验 Git blob 身份和本地计算的 SHA-256，再请求 Apple 个性化挂载，首次使用需要联网。
-`BuildManifest.plist` 的 build 必须与当前 `pymobiledevice3` 匹配。显式传入 `--ddi-dir` 时只接受本地目录中的
+`BuildManifest.plist` 必须能被当前设备的 MobileImageMounter 个性化流程接受。显式传入 `--ddi-dir` 时只接受本地目录中的
 `Image.dmg`、`BuildManifest.plist`、`Image.trustcache`，挂载限制为 180 秒。它不在
 安装目录查找或捆绑 DDI。已挂载但缺少 `mainTouchscreen` 时会发出
 `remounting_developer_image`，仅自动重挂一次。

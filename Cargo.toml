@@ -1,0 +1,33 @@
+[package]
+name = "iphone-mirror-idevice-bridge"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+idevice = { path = "vendor/idevice/idevice", features = [
+    "core_device",
+    "core_device_proxy",
+    "display_stream",
+    "mobile_image_mounter",
+    "pair",
+    "rsd",
+    "remote_pairing",
+    "mdns",
+    "tcp",
+    "tss",
+    "tunnel_tcp_stack",
+    "usbmuxd",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+plist = "1"
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+mdns-sd = "0.19"
+sha1 = "0.10"
+sha2 = "0.10"
+nusb = "0.2.4"
+
+[build-dependencies]
+cc = "1"

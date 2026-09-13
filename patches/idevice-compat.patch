@@ -1,0 +1,126 @@
+diff --git a/idevice/src/services/core_device/hid.rs b/idevice/src/services/core_device/hid.rs
+index 23fc215..72e6742 100644
+--- a/idevice/src/services/core_device/hid.rs
++++ b/idevice/src/services/core_device/hid.rs
+@@ -24,6 +24,7 @@ use crate::{
+ pub enum ButtonState {
+     Down,
+     Up,
++    Canceled,
+ }
+ 
+ impl ButtonState {
+@@ -31,6 +32,7 @@ impl ButtonState {
+         match self {
+             ButtonState::Down => 1,
+             ButtonState::Up => 2,
++            ButtonState::Canceled => 3,
+         }
+     }
+ }
+@@ -317,7 +319,7 @@ impl<R: ReadWrite> IndigoHidClient<R> {
+     /// * `usage_page` - HID usage page (e.g. `0x0C` Consumer for media keys,
+     ///   `0x01` Generic Desktop for power/sleep).
+     /// * `usage_code` - HID usage within that page.
+-    /// * `state` - [`ButtonState::Down`] or [`ButtonState::Up`].
++    /// * `state` - button down, up, or canceled.
+     pub async fn send_button(
+         &mut self,
+         usage_page: u64,
+@@ -486,6 +488,7 @@ pub struct HidSurface {
+ #[derive(Debug)]
+ pub struct UniversalHidServiceClient<R: ReadWrite> {
+     inner: RemoteXpcClient<R>,
++    feature_identifier: Cow<'static, str>,
+ }
+ 
+ #[cfg(feature = "rsd")]
+@@ -497,24 +500,52 @@ impl crate::RsdService for UniversalHidServiceClient<Box<dyn ReadWrite>> {
+     async fn from_stream(stream: Box<dyn ReadWrite>) -> Result<Self, IdeviceError> {
+         let mut inner = RemoteXpcClient::new(stream).await?;
+         inner.do_handshake().await?;
+-        Ok(Self { inner })
++        Ok(Self {
++            inner,
++            feature_identifier: obf!("com.apple.coredevice.feature.remote.universalhidservice"),
++        })
++    }
++}
++
++#[cfg(feature = "rsd")]
++impl UniversalHidServiceClient<Box<dyn ReadWrite>> {
++    /// Connect to a compatible Universal HID service whose RSD and feature
++    /// identifiers differ from the current default.
++    pub async fn connect_rsd_named(
++        provider: &mut impl crate::provider::RsdProvider,
++        handshake: &mut crate::rsd::RsdHandshake,
++        service_name: &str,
++        feature_identifier: &str,
++    ) -> Result<Self, IdeviceError> {
++        let service = handshake
++            .services
++            .get(service_name)
++            .ok_or(IdeviceError::ServiceNotFound)?;
++        let stream = provider.connect_to_service_port(service.port).await?;
++        let mut inner = RemoteXpcClient::new(stream).await?;
++        inner.do_handshake().await?;
++        Ok(Self {
++            inner,
++            feature_identifier: Cow::Owned(feature_identifier.to_string()),
++        })
+     }
+ }
+ 
+ impl<R: ReadWrite> UniversalHidServiceClient<R> {
+     pub fn new(inner: RemoteXpcClient<R>) -> Self {
+-        Self { inner }
++        Self {
++            inner,
++            feature_identifier: obf!("com.apple.coredevice.feature.remote.universalhidservice"),
++        }
+     }
+ 
+     /// Build the `{featureIdentifier, messageType: "Request", payload}` envelope
+     /// these requests share.
+-    fn request(payload: Dictionary) -> Dictionary {
++    fn request(&self, payload: Dictionary) -> Dictionary {
+         let mut msg = Dictionary::new();
+-        let universal_hid_feature: Cow<'static, str> =
+-            obf!("com.apple.coredevice.feature.remote.universalhidservice");
+         msg.insert(
+             "featureIdentifier".into(),
+-            XPCObject::String(universal_hid_feature.into()),
++            XPCObject::String(self.feature_identifier.to_string()),
+         );
+         msg.insert("messageType".into(), XPCObject::String("Request".into()));
+         msg.insert("payload".into(), XPCObject::Dictionary(payload));
+@@ -528,7 +559,7 @@ impl<R: ReadWrite> UniversalHidServiceClient<R> {
+             "connectedServices".into(),
+             XPCObject::Dictionary(Dictionary::new()),
+         );
+-        let msg = Self::request(payload);
++        let msg = self.request(payload);
+         self.inner.send_object(msg, true).await?;
+         let res = self.inner.recv().await?;
+ 
+@@ -556,7 +587,7 @@ impl<R: ReadWrite> UniversalHidServiceClient<R> {
+         .to_dictionary()
+         .unwrap();
+ 
+-        let msg = Self::request(payload);
++        let msg = self.request(payload);
+         self.inner.send_object(msg, false).await
+     }
+ 
+@@ -665,6 +696,11 @@ impl<R: ReadWrite> UniversalHidServiceClient<R> {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn canceled_button_state_uses_indigo_value_three() {
++        assert_eq!(ButtonState::Canceled.raw(), 3);
++    }
++
+     #[test]
+     fn digitizer_report_layout() {
+         let r = build_digitizer_report(100, -50, Some(0x0102030405));

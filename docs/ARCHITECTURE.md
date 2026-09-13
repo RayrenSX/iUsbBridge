@@ -84,16 +84,17 @@ iOS 18 及以后通常要求开发者模式和匹配的 Personalized DDI。桥�
 
 ## 8. 调试与验证
 
-开发运行：
+构建并运行当前 Rust bridge：
 
 ```powershell
-python src\usb_touch_bridge.py --usb --udid <UDID>
+.\build.ps1 -BridgeOnly
+.\dist\iUsbBridge.exe --usb --udid <UDID>
 ```
 
-运行逻辑测试：
+运行 Rust 单元测试：
 
 ```powershell
-python -m unittest discover -s ..\iphoneMirror\tests -p 'usb_touch_logic_test.py'
+cargo test --locked
 ```
 
 真机五指测试脚本：
@@ -102,4 +103,4 @@ python -m unittest discover -s ..\iphoneMirror\tests -p 'usb_touch_logic_test.py
 python tools\five_finger_device_test.py <UDID>
 ```
 
-看到 `ready` 且 `transport=usb`、`gateOpen=true` 后，脚本会发送五指 down、move、up 序列。`touch_surface_unavailable` 表示 DDI 或设备没有发布 Service 257；`bad_frame` 表示宿主违反 IPC 格式。
+看到 `ready` 且 `transport=usb`、`authMode` 为 `mediastream` 或 `direct` 后，脚本会发送五指 down、move、up 序列。`touch_surface_unavailable` 表示 DDI 或设备没有发布 Service 257；`bad_frame` 表示宿主违反 IPC 格式。

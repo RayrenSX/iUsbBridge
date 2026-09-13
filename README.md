@@ -1,85 +1,105 @@
 # iUsbBridge
 
-免越狱、免自签、无需额外硬件的 iPhone/iPad 本地控制桥接器。
+iUsbBridge 是面向 Windows 的独立 iPhone/iPad 控制桥接器。设备无需越狱、无需安装或自签额外 App；桥接器通过 Apple usbmuxd、CoreDevice 隧道和 Universal HID 服务发送触控、键盘、系统按钮与剪贴板操作。
 
-iUsbBridge 通过 Apple 官方设备服务，在 Windows 上以纯用户态方式控制 iPhone 和
-iPad：支持 USB 有线连接，也支持同一局域网内的本地网络连接。控制数据只在本机与
-设备之间传输，不依赖云端中转，不需要采集卡、专用 USB 控制器或其他外部硬件。
+当前主实现已迁移到 Rust，支持：
 
-项目支持触控、五指多点触控和键盘输入，可作为独立组件集成到其他桌面程序中。
-设备无需越狱，也无需为 iPhone/iPad 安装或签名额外 App；首次连接仍需解锁设备、
-信任此电脑，并在 iOS 18 及以上版本开启开发者模式。网络模式需要设备已启用 Apple
-Wi-Fi 同步，USB 模式使用数据线直连。
+- USB 有线控制与同一局域网内的无线控制
+- 点击、拖动和最多五点触控
+- 键盘按下/释放与 Home、音量等系统按钮
+- Windows 到 iOS 粘贴、iOS 剪贴板读取与无线变化推送
+- Personalized DDI 自动解析、下载、完整性校验和挂载
+- QuickTime 投屏占用常规 usbmux 通道时的原始 USB 共存链路
+- 4 字节 little-endian 长度前缀 JSON IPC
+
+旧 Python 实现仍保留在 `src/usb_touch_bridge.py`，仅供历史兼容与协议对照；正式构建使用根目录 Rust 工程。
 
 ## 系统要求
 
-本项目仅支持 iOS 18 及以上版本。iOS 17 及更早版本不在支持范围内，触控、键盘
-控制和 Personalized DDI 流程均不保证可用；项目不会将这些系统版本宣传为受支持版本。
+- Windows 10/11 x64
+- iOS/iPadOS 18 或更高版本
+- Apple Devices 或 iTunes 提供的 Apple Mobile Device Support
+- 设备已解锁并信任此电脑，且已开启开发者模式
+- Rust stable MSVC toolchain；构建原始 USB 兼容层还需要 Visual Studio C++ Build Tools
+- 无线模式要求设备已启用 Apple Wi-Fi 同步，并与电脑位于同一局域网
 
-独立的 iPhone/iPad USB 触控与键盘控制组件。它不依赖 iPhoneMirror 主程序，
-通过 Apple usbmuxd、CoreDevice 隧道和 Universal HID 服务向设备发送输入。
-
-## 目录
-
-```text
-iUsbBridge/
-├─ src/usb_touch_bridge.py       # bridge 运行时（stdin/stdout IPC）
-├─ demo/                         # 可选 WinForms 鼠标触控演示
-├─ iUsbBridge.spec               # PyInstaller 打包定义
-├─ requirements.txt              # 构建依赖
-├─ build.ps1                     # Windows 构建脚本
-└─ docs/TECHNICAL.md             # 协议、架构和排障
-```
-
-## 快速开始
-
-设备需安装 Apple Devices 或 iTunes 提供的 Apple Mobile Device Support，
-通过数据线连接、解锁并信任此电脑。开发运行：
+## 构建
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python src\usb_touch_bridge.py --usb
+.\build.ps1 -BridgeOnly
 ```
 
-对于 iOS 18 及以后版本，还需要在设备上开启开发者模式，并挂载与设备匹配的
-Personalized DDI。安装包不携带 DDI；未传入 `--ddi-dir` 时，桥接器通过
-从 GitHub 官方 API 动态解析当前 DDI commit 和文件清单，下载后同时校验 Git blob
-身份与本地计算的 SHA-256，再通过 Apple 个性化流程自动挂载它。下载的
-`BuildManifest.plist` 必须与当前 `pymobiledevice3` build 匹配；首次使用需要联网，
-离线时可显式传入一个本地、官方镜像目录：
+首次构建会把 `jkcoxson/idevice` 固定到提交 `e98264c4194e6980173c576ac79a58adce95492b`，下载到被 Git 忽略的 `vendor/idevice`，随后应用 `patches/idevice-compat.patch`。该补丁增加 Indigo canceled 按钮状态以及旧版 Universal HID 服务标识兼容，不会静默跟随上游变更。
+
+默认会先运行 Rust 单元测试。跳过测试可使用：
 
 ```powershell
-python src\usb_touch_bridge.py --usb --ddi-dir C:\path\to\official-ddi
+.\build.ps1 -BridgeOnly -SkipTests
 ```
 
-该目录必须包含 `Image.dmg`、`BuildManifest.plist` 和 `Image.trustcache`。主程序
-会优先读取 `IPHONE_MIRROR_DDI_DIR`，其次读取完整的
-`%LOCALAPPDATA%\iPhoneMirror\developer-image`；两个位置都不会随安装包提供。
-
-发布构建（需要 Python、PyInstaller 和 .NET 10 SDK）：
+构建完整 WinForms 演示包：
 
 ```powershell
 .\build.ps1
 ```
 
-输出位于 `dist/iUsbBridge-Demo/`。`iUsbBridge.exe` 是可被其他程序复用的
-控制进程，`iUsbBridgeDemo.exe` 是演示 UI。桥接器使用 onedir 运行时，发布或
-复制时必须始终保留 `iUsbBridge.exe`、同目录的 `_internal/` 和
-`iUsbBridge.runtime.json`；后者记录所有运行时文件的 SHA-256。也可以
-直接运行：
+输出：
 
-```powershell
-.\dist\iUsbBridge-Demo\iUsbBridgeDemo.exe
+```text
+dist/iUsbBridge.exe
+dist/iUsbBridge.runtime.json
+dist/iUsbBridge-Demo/
 ```
 
-完整接口定义、生命周期事件和错误处理见 [docs/TECHNICAL.md](docs/TECHNICAL.md)；系统分层和工作原理见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+运行时清单使用 schema 2，并记录单文件 Rust bridge 的 SHA-256。发布或集成时应同时复制 EXE 与清单。
 
-## 安全边界
+## 运行
 
-本组件只使用用户态 userspace TCP 隧道，不安装内核驱动、不替换 Apple 的
-`usbccgp` 驱动，也不上传设备数据。`ready` 前会验证 mainTouchscreen（Service ID
-`257`）实际存在；媒体流认证被 `9021` 拒绝时，会在通过该验证后尝试 direct
-Universal HID，而不是把未验证会话报告为可用。若检测到旧 DDI 缺少此 surface，
-桥接器只会自动刷新一次 DDI 并重建隧道。
+USB：
+
+```powershell
+.\dist\iUsbBridge.exe --usb --udid <UDID> --rate-hz 120
+```
+
+无线：
+
+```powershell
+.\dist\iUsbBridge.exe --wireless --udid <UDID> --rate-hz 120
+```
+
+启用 Apple Wi-Fi 同步：
+
+```powershell
+.\dist\iUsbBridge.exe --enable-wifi-sync --udid <UDID>
+```
+
+指定本地 Personalized DDI：
+
+```powershell
+.\dist\iUsbBridge.exe --usb --udid <UDID> --ddi-dir C:\path\to\ddi
+```
+
+未指定 `--ddi-dir` 时，bridge 会从 `doronz88/DeveloperDiskImage` 的 `PersonalizedImages/Xcode_iOS_DDI_Personalized` 路径解析固定内容并下载，缓存位置为 `%LOCALAPPDATA%\iPhoneMirror\developer-image`。目录必须包含 `Image.dmg`、`BuildManifest.plist` 和 `Image.trustcache`。
+
+## IPC
+
+bridge 从 stdin 读取二进制帧：4 字节 little-endian JSON 长度，随后是 UTF-8 JSON。当前 schema 为 `iphoneMirror.touch.v2`，支持以下 `kind`：
+
+- `touch_batch`
+- `keyboard_batch`
+- `button_event`
+- `paste_text`
+- `copy_selection`
+- `read_clipboard`
+
+stdout 每行输出一个 JSON 事件，包括 `status`、`ready`、`warning`、`error`、`clipboard_text` 和 `wifi_sync_result`。stderr 只用于诊断日志。集成方应等待 `ready` 后再发送控制帧，并在进程退出或收到不可恢复错误时重建会话。
+
+## DDI 与数据边界
+
+项目不分发 Apple 私有 DDI 文件。自动下载只接受指定 GitHub 仓库中的三个 Personalized DDI 文件，并校验 Git blob SHA-1、文件大小和本地 SHA-256 后原子发布到缓存。
+
+控制数据在本机与设备之间传输。项目不安装或替换 Apple 驱动，不上传设备内容，也不创建云端中转。
+
+## 许可
+
+本项目采用仓库中的非商业使用许可。第三方组件及其许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

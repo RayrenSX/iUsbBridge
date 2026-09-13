@@ -3,5 +3,7 @@ __pycache__/
 *.pyc
 build/
 dist/
+target/
+vendor/
 demo/bin/
 demo/obj/
