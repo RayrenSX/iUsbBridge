@@ -1160,11 +1160,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(sequence) = frame.seq {
             if last_sequence.is_some_and(|previous| sequence <= previous) {
-                emit(Event::Error {
-                    code: "invalid_sequence".into(),
-                    message: "message sequence must increase monotonically".into(),
+                emit(Event::Warning {
+                    code: "invalid_sequence_resynced".into(),
+                    message: format!(
+                        "message sequence did not increase strictly monotonically (seq={sequence} <= last={last_sequence:?}); resyncing"
+                    ),
                 })?;
-                break;
             }
             last_sequence = Some(sequence);
         }
@@ -1466,7 +1467,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let identity = match point.action.as_str() {
                 "down" => allocate_slot(&mut slots, point.pointer_id),
-                "move" => slots.get(&point.pointer_id).copied(),
+                "move" => slots
+                    .get(&point.pointer_id)
+                    .copied()
+                    .or_else(|| allocate_slot(&mut slots, point.pointer_id)),
                 _ => None,
             };
             let Some(identity) = identity else { continue };
@@ -2802,6 +2806,14 @@ mod tests {
         assert_eq!(allocate_slot(&mut slots, 100), Some(0));
         slots.remove(&100);
         assert_eq!(allocate_slot(&mut slots, 300), Some(0));
+    }
+
+    #[test]
+    fn orphan_move_allocates_slot_when_missing() {
+        let mut slots = HashMap::new();
+        let id = slots.get(&100).copied().or_else(|| allocate_slot(&mut slots, 100));
+        assert_eq!(id, Some(0));
+        assert_eq!(slots.get(&100), Some(&0));
     }
 
     #[test]
