@@ -1,0 +1,153 @@
+"""Offline functional probes run inside the frozen bridge during preflight.
+
+No sockets are opened, no device is contacted, and no persistent state is changed.
+"""
+import ssl
+import struct
+import asyncio
+import sys
+from types import SimpleNamespace
+from pathlib import Path
+
+import httpx
+from anyio._backends._asyncio import AsyncIOBackend
+
+import certifi
+import lzfse
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from pymobiledevice3.remote.xpc_message import (
+    XpcUInt64Type, XpcWrapper, create_xpc_wrapper, decode_xpc_object,
+)
+from qh3.quic.configuration import QuicConfiguration
+from qh3.quic.connection import QuicConnection
+
+
+def check_usb_backends():
+    """Load both bundled backends without enumerating or opening a device."""
+    from iostouch.qt.usb import get_backend
+
+    checks = []
+    for backend, filename in (('libusb0', 'libusb0.dll'), ('libusb1', 'libusb-1.0.dll')):
+        if getattr(sys, 'frozen', False) and not (Path(sys._MEIPASS) / filename).is_file():
+            raise RuntimeError(f'Bundled USB backend is missing: _internal/{filename}')
+        # Importing usb.backend.* alone succeeds even when the DLL cannot load.
+        # Require each backend explicitly; fallback could mask missing libusb0.
+        if get_backend(backend) is None:
+            raise RuntimeError(f'USB backend could not be loaded: {backend}')
+        checks.append(f'usb_backend_{backend}')
+    return checks
+
+
+def check_runtime_functionality(build_touchscreen_report, contact, release, build_touchscreen_frame):
+    checks = []
+    from coredevice_media import Feedback, HevcReceiver, RtpPacket
+    from device_hub import DeviceHub
+    from device_management import ACTIONS, setting_input
+    receiver = HevcReceiver()
+    if receiver.push(RtpPacket(1, 0, 123, True, 96, b'\x02\x01delta')) is not None or not receiver.wait_key:
+        raise RuntimeError('CoreDevice keyframe admission failed')
+    if len(Feedback(789, 123).rctl(1)) != 32 or DeviceHub is None:
+        raise RuntimeError('CoreDevice feedback/bridge import failed')
+    checks.append('replay_codec_and_hid_feedback')
+    mapped_actions = ('stat_file', 'write_mapped_file', 'make_directory', 'move_file', 'delete_mapped_file', 'set_mapped_file_time')
+    if (len(ACTIONS) != 36 or
+            ACTIONS.get('restart_with_metal_hud') != {'readOnly': False, 'public': True, 'timeout': 35} or
+            ACTIONS['upload_file']['public'] or ACTIONS['upload_file']['readOnly'] or
+            ACTIONS['delete_file']['public'] or ACTIONS['delete_file']['readOnly'] or
+            any(action not in ACTIONS or ACTIONS[action]['public'] or
+                ACTIONS[action]['readOnly'] != (action == 'stat_file') for action in mapped_actions) or
+            setting_input('appearance', 'dark') != {'style': 'dark'}):
+        raise RuntimeError('Device Hub contract/settings payload mismatch')
+    checks.append('device_management_contract')
+    if sys.platform == 'win32' and getattr(sys, 'frozen', False):
+        checks.extend(check_usb_backends())
+    payload = {'text': 'clipboard 中文 😀', 'id': XpcUInt64Type(42),
+               'report': b'\x00\x01\xff', 'values': [True, None, 1.25]}
+    wire = create_xpc_wrapper(payload, message_id=7, wanting_reply=True)
+    parsed = XpcWrapper.parse(wire)
+    if parsed.message.message_id != 7 or decode_xpc_object(parsed.message.payload.obj) != payload:
+        raise RuntimeError('XPC roundtrip failed')
+    checks.append('xpc_roundtrip')
+
+    for slot in range(5):
+        down = build_touchscreen_report(slot, contact, 123, 456, timestamp=1)
+        up = build_touchscreen_report(slot, release, 123, 456, timestamp=1)
+        if (len(down) != 58 or len(up) != 58 or down[3] != (0xC0 | slot) or up[3] != slot
+                or down[40 + slot] != slot + 1 or down[45:51] != b'\x01\x00\x00\x00\x00\x00'):
+            raise RuntimeError('HID report serialization failed')
+    checks.append('five_slot_hid_reports')
+
+    # Exercise the full multi-contact encoder in the packaged executable, not
+    # just five separate single-contact reports (which cannot preserve holds).
+    for released_slot in (None, 2):
+        frame = build_touchscreen_frame([
+            (slot, release if slot == released_slot else contact, 100 + slot, 200 + slot)
+            for slot in range(5)], timestamp=1)
+        if len(frame) != 58 or frame[:3] != bytes((9, 5, 5)):
+            raise RuntimeError('Multi-contact HID frame header failed')
+        for slot in range(5):
+            flags, x, y = struct.unpack_from('<BHH', frame, 3 + slot * 5)
+            expected = slot if slot == released_slot else 0xC0 | slot
+            if (flags, x, y, frame[40 + slot]) != (expected, 100 + slot, 200 + slot, slot + 1):
+                raise RuntimeError('Multi-contact HID hold/release failed')
+    checks.append('simultaneous_contacts_independent_release')
+
+    # QuicConnection builds encrypted packets in memory; it does not own a socket.
+    connection = QuicConnection(configuration=QuicConfiguration(is_client=True, alpn_protocols=['h3']))
+    connection.connect(('127.0.0.1', 443), now=0)
+    packets = connection.datagrams_to_send(now=0)
+    if not packets or not all(len(packet) >= 1200 for packet, _ in packets):
+        raise RuntimeError('QUIC initial packet encryption failed')
+    connection.close()
+    checks.append('quic_initial_encryption')
+
+    aes = AESGCM(bytes(range(32)))
+    nonce, plaintext = bytes(range(12)), b'offline bridge dependency check' * 20
+    if aes.decrypt(nonce, aes.encrypt(nonce, plaintext, b'probe'), b'probe') != plaintext:
+        raise RuntimeError('AES-GCM roundtrip failed')
+    checks.append('aes_gcm_roundtrip')
+    if lzfse.decompress(lzfse.compress(plaintext)) != plaintext:
+        raise RuntimeError('LZFSE roundtrip failed')
+    checks.append('lzfse_roundtrip')
+    if ssl.create_default_context(cafile=certifi.where()).cert_store_stats()['x509_ca'] == 0:
+        raise RuntimeError('Bundled CA store is empty')
+    checks.append('ca_store')
+    async def check_ddi_http_transport():
+        # Exercise the frozen HTTP client's TLS construction and async backend
+        # without opening a socket or sending a device ticket.
+        AsyncIOBackend.current_time()
+        async with httpx.AsyncClient(trust_env=False) as client:
+            if client.is_closed:
+                raise RuntimeError('DDI HTTP client closed unexpectedly')
+    asyncio.run(check_ddi_http_transport())
+    checks.append('ddi_async_http_transport')
+    async def check_cryptex_owned_channels():
+        from ddi_support import _CryptexRsd
+        from pymobiledevice3.services.cryptexd import CryptexdService
+        from pymobiledevice3.remote.remotexpc import RemoteXPCConnection
+
+        class Writer:
+            closed = False
+            def close(self): self.closed = True
+            async def wait_closed(self): pass
+
+        writer = Writer()
+        async def open_connection(*_): return object(), writer
+        async def handshake(): pass
+        async def response(_): return {'error': 0, 'argv': {}}
+        connection = RemoteXPCConnection(('offline', 1), open_connection=open_connection)
+        connection._do_handshake = handshake
+        connection.send_receive_request = response
+        rsd = SimpleNamespace(start_remote_service=lambda _: connection)
+        owner = _CryptexRsd(rsd)
+        try:
+            if await CryptexdService(owner).copy_installed() != []:
+                raise RuntimeError('Cryptex inventory parsing failed')
+        finally:
+            await owner.close()
+        if not writer.closed or connection._writer is not None:
+            raise RuntimeError('Cryptex channel ownership failed')
+
+    asyncio.run(check_cryptex_owned_channels())
+    checks.append('cryptex_owned_channels')
+    return checks

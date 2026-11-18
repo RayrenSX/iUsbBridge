@@ -1,105 +1,76 @@
 # iUsbBridge
 
-iUsbBridge 是面向 Windows 的独立 iPhone/iPad 控制桥接器。设备无需越狱、无需安装或自签额外 App；桥接器通过 Apple usbmuxd、CoreDevice 隧道和 Universal HID 服务发送触控、键盘、系统按钮与剪贴板操作。
+iUsbBridge 是面向 Windows 的独立 iPhone/iPad 控制桥接器。设备无需越狱，无需安装或自签额外 App；桥接器通过 Apple 设备服务发送触控、键盘、系统按钮和剪贴板操作。
 
-当前主实现已迁移到 Rust，支持：
+`main` 维护 iPhoneMirror 当前使用的 Python 实现；Rust 实现保存在 [`codex/rust-backend`](https://github.com/RayrenSX/iUsbBridge/tree/codex/rust-backend) 分支。两者的运行时布局不同，集成时应使用对应分支的构建脚本和清单。
 
-- USB 有线控制与同一局域网内的无线控制
-- 点击、拖动和最多五点触控
-- 键盘按下/释放与 Home、音量等系统按钮
-- Windows 到 iOS 粘贴、iOS 剪贴板读取与无线变化推送
-- Personalized DDI 自动解析、下载、完整性校验和挂载
-- QuickTime 投屏占用常规 usbmux 通道时的原始 USB 共存链路
-- 4 字节 little-endian 长度前缀 JSON IPC
+当前 Python 实现包含：
 
-旧 Python 实现仍保留在 `src/usb_touch_bridge.py`，仅供历史兼容与协议对照；正式构建使用根目录 Rust 工程。
+- USB 有线控制、RemotePairing 无线发现，以及 QuickTime 投屏时的 USBMux 共存与恢复。
+- 最多五点同时触控、独立释放、键盘输入、系统按钮和双向剪贴板。
+- Personalized / Cryptex DDI 准备、下载校验、超时与连接清理。
+- HID 会话健康检查、后台更新、输入与剪贴板恢复。
+- 设备管理 IPC：应用、进程、共享文档、文件操作、日志和设备设置。
+- 选定应用的 Metal HUD 重启请求，固定使用 `MTL_HUD_ENABLED=1`。
 
 ## 系统要求
 
-- Windows 10/11 x64
-- iOS/iPadOS 18 或更高版本
-- Apple Devices 或 iTunes 提供的 Apple Mobile Device Support
-- 设备已解锁并信任此电脑，且已开启开发者模式
-- Rust stable MSVC toolchain；构建原始 USB 兼容层还需要 Visual Studio C++ Build Tools
-- 无线模式要求设备已启用 Apple Wi-Fi 同步，并与电脑位于同一局域网
+- Windows 10/11 x64，Python 3.13 x64；构建演示程序另需 .NET 10 SDK。
+- iOS/iPadOS 18 或更高版本，设备已解锁、信任此电脑，并开启开发者模式。
+- Apple Devices 或 iTunes 提供的 Apple Mobile Device Support。
+- 无线控制需要完成设备配对，并与电脑位于同一局域网。
+
+## 开发运行与测试
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python src\usb_touch_bridge.py --check-runtime
+python -m unittest discover -s tests -p "*_test.py"
+python src\usb_touch_bridge.py --usb --udid <UDID>
+```
+
+回归测试使用模拟设备服务，不操作真实手机。可选的 CoreDevice 解码器集成测试在未提供外部解码器时跳过，详见 [tests/README.md](tests/README.md)。
 
 ## 构建
 
-```powershell
-.\build.ps1 -BridgeOnly
-```
+Python 构建需要两个固定版本的 Windows x64 USB 后端。把下列文件放在 `native/`，或通过 `-NativeDirectory` 指定包含这两个文件的目录：
 
-首次构建会把 `jkcoxson/idevice` 固定到提交 `e98264c4194e6980173c576ac79a58adce95492b`，下载到被 Git 忽略的 `vendor/idevice`，随后应用 `patches/idevice-compat.patch`。该补丁增加 Indigo canceled 按钮状态以及旧版 Universal HID 服务标识兼容，不会静默跟随上游变更。
+| 文件 | SHA-256 |
+| --- | --- |
+| `libusb0.dll` | `4F18B5D2C28AA66B648C8683C6D09B52B92CBBEE85984BBEFAD5F38A64BC2A14` |
+| `libusb-1.0.dll` | `5072054CB3002AE071F382AD5C2C2B0092D9451C537D0C13444C2B6F968F7251` |
 
-默认会先运行 Rust 单元测试。跳过测试可使用：
-
-```powershell
-.\build.ps1 -BridgeOnly -SkipTests
-```
-
-构建完整 WinForms 演示包：
+这与 iPhoneMirror 的固定载荷一致：分别来自 `src/DriverInstaller/Assets/libusb-win32-1.2.6.0/amd64/` 和 `third_party/libusb/bin/x64/`。DLL 不提交到本仓库。构建会校验哈希，并通过自定义 PyInstaller hook 将两个后端打包到 `_internal/`。
 
 ```powershell
-.\build.ps1
+.\build.ps1 -BridgeOnly -NativeDirectory C:\path\to\usb-dlls
+# 包含 WinForms 演示程序：
+.\build.ps1 -NativeDirectory C:\path\to\usb-dlls
 ```
 
-输出：
+默认构建环境位于 `work/usb-touch-bridge-python`；可用 `-EnvironmentPath` 指定其他环境。输出如下：
 
 ```text
-dist/iUsbBridge.exe
-dist/iUsbBridge.runtime.json
-dist/iUsbBridge-Demo/
+dist/iUsbBridge/iUsbBridge.exe
+dist/iUsbBridge/iUsbBridge.runtime.json
+dist/iUsbBridge/_internal/
+dist/iUsbBridge-Demo/                 # 未指定 -BridgeOnly 时生成
 ```
 
-运行时清单使用 schema 2，并记录单文件 Rust bridge 的 SHA-256。发布或集成时应同时复制 EXE 与清单。
+构建会执行冻结程序的 `--check-runtime`。清单使用 schema `1`，记录运行时文件的 SHA-256；发布时必须一起保留 EXE、清单和 `_internal/`。`ready` 事件的协议号为 `2`，与清单版本含义不同。
 
-## 运行
+## 接入
 
-USB：
+stdin 接收四字节 little-endian 长度前缀的 UTF-8 JSON，stdout 输出 JSON Lines 事件，诊断日志写入 stderr。宿主应等待 `ready`，并持续读取事件。完整参数、消息格式、设备管理请求与错误处理见 [docs/TECHNICAL.md](docs/TECHNICAL.md)，实现分层见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
-```powershell
-.\dist\iUsbBridge.exe --usb --udid <UDID> --rate-hz 120
-```
+仓库不分发 Apple DDI 文件。桥接器可使用本地镜像、缓存或经校验的下载完成准备，Apple 个性化仍可能需要联网。可选 CoreDevice 媒体解码器由 iPhoneMirror 单独构建，普通 HID 控制不依赖它。
 
-无线：
+## 同步来源
 
-```powershell
-.\dist\iUsbBridge.exe --wireless --udid <UDID> --rate-hz 120
-```
-
-启用 Apple Wi-Fi 同步：
-
-```powershell
-.\dist\iUsbBridge.exe --enable-wifi-sync --udid <UDID>
-```
-
-指定本地 Personalized DDI：
-
-```powershell
-.\dist\iUsbBridge.exe --usb --udid <UDID> --ddi-dir C:\path\to\ddi
-```
-
-未指定 `--ddi-dir` 时，bridge 会从 `doronz88/DeveloperDiskImage` 的 `PersonalizedImages/Xcode_iOS_DDI_Personalized` 路径解析固定内容并下载，缓存位置为 `%LOCALAPPDATA%\iPhoneMirror\developer-image`。目录必须包含 `Image.dmg`、`BuildManifest.plist` 和 `Image.trustcache`。
-
-## IPC
-
-bridge 从 stdin 读取二进制帧：4 字节 little-endian JSON 长度，随后是 UTF-8 JSON。当前 schema 为 `iphoneMirror.touch.v2`，支持以下 `kind`：
-
-- `touch_batch`
-- `keyboard_batch`
-- `button_event`
-- `paste_text`
-- `copy_selection`
-- `read_clipboard`
-
-stdout 每行输出一个 JSON 事件，包括 `status`、`ready`、`warning`、`error`、`clipboard_text` 和 `wifi_sync_result`。stderr 只用于诊断日志。集成方应等待 `ready` 后再发送控制帧，并在进程退出或收到不可恢复错误时重建会话。
-
-## DDI 与数据边界
-
-项目不分发 Apple 私有 DDI 文件。自动下载只接受指定 GitHub 仓库中的三个 Personalized DDI 文件，并校验 Git blob SHA-1、文件大小和本地 SHA-256 后原子发布到缓存。
-
-控制数据在本机与设备之间传输。项目不安装或替换 Apple 驱动，不上传设备内容，也不创建云端中转。
+本轮从 iPhoneMirror 的 `main`（提交 `cd7bdd5` 及 2026-11-18 工作区中的设备管理改动）同步 Python 运行时、打包配方及相关回归测试；包括 `restart_with_metal_hud` 契约和实现。独立仓库原有未提交修复已逐项核对，当前实现保留了对应功能。
 
 ## 许可
 
-本项目采用仓库中的非商业使用许可。第三方组件及其许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+采用 [iUsbBridge 非商业使用许可](LICENSE)。版权所有 (c) 2026 RayrenSX；商业用途需事先联系作者取得许可：renxiang080104@gmail.com。第三方来源和许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

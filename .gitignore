@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 build/
 dist/
-target/
-vendor/
+native/
+work/
 demo/bin/
 demo/obj/

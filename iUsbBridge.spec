@@ -1,10 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 import importlib.util
+import os
 import sys
+from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files, copy_metadata
 
 hiddenimports = []
-hiddenimports += collect_submodules('pymobiledevice3')
+# Analyse imports from our bridge, not every upstream CLI/service. Collecting
+# all of pymobiledevice3 pulls in screenshot/video tooling (PyAV and Pillow)
+# which the HID bridge does not use. Keep the lazy tunnel/media gate below.
 hiddenimports += collect_submodules('qh3')
 hiddenimports += collect_submodules('srptools')
 hiddenimports += collect_submodules('construct')
@@ -37,7 +41,6 @@ hiddenimports += [
     'pymobiledevice3.remote.core_device.hid_service',
     'pymobiledevice3.remote.core_device.display_service',
     'pymobiledevice3.remote.core_device.screen_stream',
-    'pymobiledevice3.remote.core_device.screen_capture_service',
     'pymobiledevice3.remote.core_device.core_device_service',
     'pymobiledevice3.remote.remote_service_discovery',
     'pymobiledevice3.remote.remotexpc',
@@ -45,6 +48,7 @@ hiddenimports += [
     'pymobiledevice3.remote.common',
     'pymobiledevice3.remote.module_imports',
     'pymobiledevice3.lockdown',
+    'pymobiledevice3.services.cryptexd',
     'pmd_pytcp',
     'pytun_pmd3',
     'pytun_pmd3.wintun',
@@ -52,6 +56,7 @@ hiddenimports += [
 hiddenimports = existing_modules(hiddenimports)
 
 datas = []
+datas += [(str(Path(SPECPATH) / 'src' / 'device_hub_contract.json'), '.')]
 datas += collect_data_files('pymobiledevice3')
 datas += collect_data_files('qh3')
 datas += collect_data_files('developer_disk_image')
@@ -63,16 +68,28 @@ datas += collect_data_files('pytun_pmd3')
 # its .dist-info must accompany the onedir bridge as well.
 datas += copy_metadata('pyimg4')
 
+# Onedir places these at _internal's root (sys._MEIPASS). Merely shipping
+# them beside iPhoneMirror.exe cannot satisfy pyi_rth_usb's library lookup.
+native_directory = Path(os.environ.get('IUSBBRIDGE_NATIVE_DIRECTORY',
+                                       str(Path(SPECPATH) / 'native')))
+usb_binaries = [(str(native_directory / name), '.')
+                for name in ('libusb0.dll', 'libusb-1.0.dll')]
+
 a = Analysis(
     ['src/usb_touch_bridge.py'],
     pathex=[],
-    binaries=[],
+    binaries=usb_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
-    hookspath=[],
+    # Override hook-usb: its host discovery can add aliases such as usb-1.0.dll
+    # that shadow the pinned libusb0 backend in the standard runtime hook.
+    hookspath=[str(Path(SPECPATH) / 'hooks')],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['pytest', 'IPython', 'jedi', 'frida', 'py_spy'],
+    # Artwork test dependencies may be installed in the build environment.
+    # Keep those and optional image formatting out of the HID runtime.
+    excludes=['pytest', 'IPython', 'jedi', 'frida', 'py_spy', 'pygments.formatters.img',
+              'PIL', 'numpy', 'scipy'],
     noarchive=False,
 )
 

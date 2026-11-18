@@ -1,106 +1,96 @@
 # iUsbBridge 架构与工作原理
 
-## 1. 定位
+iUsbBridge 将宿主输入转换为 iOS Universal HID 报告，同时提供当前设备会话上的剪贴板与设备管理 RPC。当前 `main` 使用 Python/pymobiledevice3 实现，面向 Windows 与 iOS 18 及以上版本。IPC 详见 [TECHNICAL.md](TECHNICAL.md)。
 
-iUsbBridge 是一个独立的 Windows 用户态输入桥接器。它把宿主程序产生的鼠标、触摸和键盘事件转换为 iOS Universal HID 报告，并通过 Apple 官方设备服务送入 iPhone/iPad。它不负责视频采集、解码、渲染，也不安装或替换内核驱动。
-
-核心原则是：只有真实发现并验证了 `mainTouchscreen` 服务，才发送 `ready`；任何连接、认证或服务缺失都报告为错误，不伪造可用状态。
-
-兼容性边界：项目面向 iOS 18 及以上。iOS 17 及更早版本不属于支持目标，不能据此推断其触控或键盘功能可用。
-
-## 2. 总体拓扑
+## 1. 总体链路
 
 ```text
-宿主程序（C#/Rust/Go/Python）
-        │ stdin: uint32 LE 长度 + UTF-8 JSON
-        ▼
-iUsbBridge.exe
-  ├─ BridgeChannel：帧校验、生命周期事件、退出清理
-  ├─ TouchSession：设备会话、重试、DDI 和 HID 初始化
-  ├─ FiveSlotStateMachine：pointerId → slot 0..4
-  └─ HID 报告编码器：坐标和状态 → 58 字节报告
-        │
-        ├─ USB：Apple usbmuxd / Lockdown
-        ├─ CoreDeviceTunnelProxy（用户态 TCP 隧道）
-        ├─ RSD / RemoteXPC
-        └─ com.apple.coredevice.hid.universalhidservice
-             ├─ Service 257 mainTouchscreen
-             └─ Service 512 keyboard
+宿主程序（C# / Rust / Go / Python）
+    │ stdin：uint32 LE 字节长度 + UTF-8 JSON
+    │ stdout：UTF-8 JSON Lines；stderr：日志
+    ▼
+BridgeChannel → TouchSession
+    ├─ USB：Apple usbmuxd / Lockdown
+    │       └─ QuickTime 配置下可共享同一设备的用户态 USBMux
+    └─ 无线：Network Lockdown / 已配对 RemotePairing mDNS
+             ↓
+       userspace TCP 隧道 → RSD / RemoteXPC
+             ├─ Universal HID：触控与键盘
+             ├─ Indigo HID：系统按键
+             ├─ Pasteboard：剪贴板辅助通道
+             ├─ DeviceHub：当前设备的管理服务
+             └─ DisplayService：可选媒体认证与反馈
 ```
 
-`--usb` 只选择物理 USB 记录；`--wireless` 只选择 Network/RemotePairing 记录，不在两种传输之间静默回退。
+`--usb` 与 `--wireless` 不在控制传输之间静默回退。指定 UDID 后核对目标身份，允许连字符和大小写差异；不会采用唯一但序列号不匹配或不可读的手机。无线准备 DDI 必要时可借助同一设备的可信 USB 连接，随后仍建立无线控制。
 
-## 3. 启动与会话生命周期
+## 2. 模块职责
 
-1. 解析命令行参数并创建 stdin/stdout IPC 通道。
-2. 通过 usbmuxd 枚举设备；指定 `--udid` 时严格匹配目标设备。
-3. 使用 Lockdown 检查配对、开发者模式和设备身份。
-4. 检查 Personalized DDI。缺少时，从官方清单解析并下载 `Image.dmg`、`BuildManifest.plist`、`Image.trustcache`，校验大小、SHA-256 和 Git blob 身份后请求 Apple 个性化挂载。
-5. 建立 CoreDevice 隧道，连接 RSD（Remote Service Discovery）。
-6. 打开 Universal HID 服务，读取服务表并确认 Service ID `257`。
-7. 某些系统会拒绝 `startmediastream`（错误 9021）。此时先验证 direct Universal HID；验证成功仍可进入 `authMode=direct`，验证失败才报告不支持。
-8. 输出 `ready`，宿主开始发送输入帧。
-9. stdin 关闭、会话断开或出现异常时，发送空键盘报告并释放 slot 0..4，然后关闭隧道。
+| 模块 | 职责 |
+| --- | --- |
+| [usb_touch_bridge.py](../src/usb_touch_bridge.py) | CLI、IPC、触点状态、键盘/按键、会话建立、认证、健康检查和恢复。 |
+| [ddi_support.py](../src/ddi_support.py) | 可取消的 Personalized/Cryptex 准备、校验、签名及连接清理。 |
+| [mdns_discovery.py](../src/mdns_discovery.py) | 多网卡 RemotePairing mDNS 发现。 |
+| [iostouch/qt](../src/iostouch/qt) | QuickTime 配置的用户态 USBMux、包组装、TCP 序列与本地兼容服务。 |
+| [pasteboard_text.py](../src/pasteboard_text.py) / [pasteboard_recovery.py](../src/pasteboard_recovery.py) | 文本表示解码、转换恢复和辅助服务资源检查。 |
+| [screen_orientation.py](../src/screen_orientation.py) | 只读方向观察及已有捕获 USBMux 的复用。 |
+| [device_hub.py](../src/device_hub.py) | RPC 调度、取消、代次隔离与媒体 gate 反馈。 |
+| [device_management.py](../src/device_management.py) / [document_file_service.py](../src/document_file_service.py) | 所选设备服务调用、文件路径与共享 Documents 边界。 |
+| [device_hub_contract.json](../src/device_hub_contract.json) | 动作、读取/写入属性、暴露范围和超时的共同契约。 |
+| [coredevice_media.py](../src/coredevice_media.py) | RTP/HEVC 组帧、RTCP 反馈、录制与可选解码/重放。 |
+| [bridge_runtime_check.py](../src/bridge_runtime_check.py) | 冻结运行时中的离线依赖与功能验证。 |
 
-## 4. IPC 协议
+普通 HID 和设备管理不需要外部媒体解码器。实际媒体解码/重放才使用可选的 `CoreDevice/iPhoneMirror.MediaDecoder.exe`；查找位置见调用文档。
 
-每一帧为：`4 字节 little-endian 无符号长度` + `长度字节的 UTF-8 JSON`。长度必须大于 0 且不超过 65536。stdout 只输出 JSON Lines 事件，诊断日志写入 stderr，宿主必须持续读取 stdout 以避免管道阻塞。
+## 3. 启动与恢复
 
-触控帧：
+1. 创建有界 IPC 输入队列，同时观察 stdin 关闭，允许取消尚未完成的启动。
+2. 发现所选传输上的设备，建立可信 Lockdown，检查身份、开发者模式与 DDI。
+3. 建立 userspace 隧道和 RSD，打开 HID，验证 mainTouchscreen（Service ID `257`）。
+4. 根据设备能力使用媒体认证或经过验证的 direct HID，准备键盘并验证实际发送通道。
+5. 发出 `ready`，包含 UDID、transport、capabilities 与递增的 `generation`。
+6. 健康检查、空闲 HID 更新和故障恢复保持会话可用；恢复会取消旧设备管理与剪贴板操作。
+7. 重新验证后发布新 `ready`；旧代次输入被丢弃。退出时有界释放所属资源。
 
-```json
-{"schema":"iphoneMirror.touch.v2","kind":"touch_batch","seq":1,"timestampNs":0,"points":[{"pointerId":1,"action":"down","normalizedX":0.5,"normalizedY":0.5}]}
-```
+仅发现服务名称或挂载成功不足以报告 `ready`。桥接器还会发送无害释放报告并等待同一 HID 连接的响应；媒体认证会话持续检查真实媒体流健康。键盘与触控持有状态受到生命周期锁保护，更新 HID 时不会在活动手势中替换健康连接。
 
-`points` 数量为 1..5；动作是 `down`、`move`、`up`；坐标必须在 `[0,1]`。键盘帧使用同一 schema，`kind` 为 `keyboard_batch`，`usages` 是当前完整按下集合而不是增量。
+## 4. 五点触控与 HID 编码
 
-## 5. 五指触控原理
+`FiveSlotStateMachine` 为逻辑 `pointerId` 分配最小空闲 slot 0–4，移动时保持 slot，释放后回收。IPC 批次表达本次变化；编码器合并保留的全部活动手指与本批释放手指，每批发送一份完整快照。省略其他活动手指的 HID 报告会使设备释放它们，因此不能用五份互相独立的单触点报告替代真正多点输入。
 
-`pointerId` 是宿主侧逻辑触点 ID，iOS 报告使用固定 slot。状态机按最小空闲 slot 分配 0..4；同一 pointer 在移动期间保持原 slot；释放后 slot 回收并按顺序复用。超过五个同时触点会被拒绝，不会覆盖已有触点。
+固定 58 字节报告布局由 `build_touchscreen_frame` 与本地测试锁定：
 
-每个触点独立发送一个 58 字节 `mainTouchscreen` 报告：
+| 偏移 | 字节数 | 内容 |
+| --- | ---: | --- |
+| 0 | 1 | Report ID `0x09`。 |
+| 1 | 1 | 本报告记录数，含本次释放，范围 1–5。 |
+| 2 | 1 | 最大触点数 `0x05`。 |
+| 3–27 | 25 | 最多五条 5 字节记录：状态/slot、X u16 LE、Y u16 LE。contact 为 `0xC0 \| slot`，release 为 `slot`。 |
+| 28–39 | 12 | 滚动集合，全零。 |
+| 40–44 | 5 | 按 slot 索引的 identity；所含 slot 写入 `slot + 1`。 |
+| 45–50 | 6 | 48 位 little-endian 单调时间戳。 |
+| 51–57 | 7 | 扩展手势标记，全零。 |
 
-- Report ID：`0x09`
-- contact 状态：`0xC2 | slot`
-- release 状态：`0x02 | slot`
-- X/Y：归一化坐标乘以 `65535` 后四舍五入，按 little-endian `u16` 写入
-- 固定设备字段位于报告偏移 40
-- 48 位 little-endian 时间戳位于偏移 44
+坐标按 `round(normalized * 65535)` 转换。按住期间可重复最后确认的完整快照，维持静止手指，不生成新的按下或重复键盘字符。`--rate-hz` 是提示值，实际输入频率还受宿主和设备处理能力影响。
 
-一帧中的多个触点按 slot 顺序逐个写入 HID 服务；120Hz 默认速率由事件循环控制。退出时所有仍占用的 slot 都发送 release，避免设备端残留按下状态。
+## 5. 连接所有权与边界
 
-## 6. DDI 与服务发现
+QuickTime 镜像下，桥接器只管理同一设备的 USBMux 接口（子类 `0xFE`），在动态回环端口提供兼容 usbmuxd 服务；不读取视频接口 `0x2A`，不更改设备 USB 配置。接收路径组装 USB 分片、裁剪 TCP 重传、限制乱序窗口，并在缺口超时或传输失败时结束受影响连接。恢复保存的 USBMux 状态后仍须验证 Lockdown/HID，不能仅凭监听端口判活。
 
-iOS 18 及以后通常要求开发者模式和匹配的 Personalized DDI。桥接器不把 DDI 打进发布包：自动模式使用缓存和受校验的下载源，离线模式由 `--ddi-dir` 显式提供官方文件。DDI 挂载成功不等于触控可用，因此 RSD 建立后仍必须检查 Universal HID 的真实服务表。
+每项 DeviceHub 操作复用所选设备的 RSD，并拥有独立服务通道、超时和返回大小限制。文件服务限制到请求根目录，共享 Documents 先完成 House Arrest 协商再启动 AFC 读取。动作契约的 `public` 为集成元数据，宿主负责决定自身对外暴露哪些修改操作。
 
-## 7. 可靠性与安全边界
+剪贴板是有界辅助通道，每次 PULL/SET 使用新连接并串行处理；设备恢复、前台写入与请求取消会淘汰旧结果。它不直接操作 Windows 剪贴板，宿主自行决定如何应用返回文本。
 
-- usbmux、Lockdown、隧道和 HID 初始化均有超时与有限重试。
-- 发现旧 DDI 缺少 `mainTouchscreen` 时最多自动刷新一次并重建隧道。
-- 输入帧严格校验 schema、kind、长度、坐标、动作和触点数量。
-- 仅使用用户态 Apple 服务和 userspace TCP，不安装 WinUSB/libusb 过滤驱动。
-- 不上传屏幕、触控或设备内容；桥接器只发送宿主明确提供的输入。
-- `ready` 是能力承诺，必须晚于 Service ID `257` 验证。
+桥接器不安装内核驱动，也不依赖云端控制中转。DDI 自动准备可能访问上游下载与 Apple 个性化服务；设备管理只执行宿主明确请求的动作。断开后的释放为尽力清理，不能保证已经离线的设备收到报告。
 
-## 8. 调试与验证
+## 6. 构建与验证
 
-构建并运行当前 Rust bridge：
+[build.ps1](../build.ps1) 使用固定 [requirements.txt](../requirements.txt) 和 [iUsbBridge.spec](../iUsbBridge.spec) 构建 Python onedir 运行时。交付时保留 EXE、`_internal` 与 schema 1 完整性清单；发布目录和自检命令见调用文档。
+
+仓库根目录运行：
 
 ```powershell
-.\build.ps1 -BridgeOnly
-.\dist\iUsbBridge.exe --usb --udid <UDID>
+python -m unittest discover -s tests -p '*_test.py'
 ```
 
-运行 Rust 单元测试：
-
-```powershell
-cargo test --locked
-```
-
-真机五指测试脚本：
-
-```powershell
-python tools\five_finger_device_test.py <UDID>
-```
-
-看到 `ready` 且 `transport=usb`、`authMode` 为 `mediastream` 或 `direct` 后，脚本会发送五指 down、move、up 序列。`touch_surface_unavailable` 表示 DDI 或设备没有发布 Service 257；`bad_frame` 表示宿主违反 IPC 格式。
+[tests](../tests) 覆盖编码、传输重组、恢复代次、剪贴板、DDI 与设备管理，不需要连接手机。媒体二进制集成测试在缺少可选解码器时跳过。[five_finger_device_test.py](../tools/five_finger_device_test.py) 是另一个会向真机发送五指 down/move/up 的工具；运行前先检查其可执行文件路径和动作坐标，确认设备页面适合操作。

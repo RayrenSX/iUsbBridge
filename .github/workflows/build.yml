@@ -1,4 +1,4 @@
-name: Build
+name: Python bridge tests
 
 on:
   push:
@@ -6,17 +6,17 @@ on:
   pull_request:
 
 jobs:
-  windows:
+  python:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build and test bridge
-        shell: pwsh
-        run: .\build.ps1 -BridgeOnly
-      - uses: actions/upload-artifact@v4
+      - uses: actions/setup-python@v5
         with:
-          name: iUsbBridge-win-x64
-          path: |
-            dist/iUsbBridge.exe
-            dist/iUsbBridge.runtime.json
+          python-version: '3.13'
+          cache: pip
+      - name: Install bridge dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Check runtime without a device
+        run: python src/usb_touch_bridge.py --check-runtime
+      - name: Run Python bridge regression tests
+        run: python -m unittest discover -s tests -p "*_test.py"

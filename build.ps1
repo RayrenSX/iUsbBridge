@@ -1,131 +1,192 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Debug', 'Release')]
-    [string]$Configuration = 'Release',
+    [string]$Python = "python",
+    [string]$Configuration = "Release",
     [switch]$BridgeOnly,
-    [switch]$SkipTests,
-    [string]$BridgeOutputPath
+    [string]$BridgeOutputPath,
+    [string]$EnvironmentPath,
+    [string]$NativeDirectory
 )
 
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = "Stop"
 $Root = [IO.Path]::GetFullPath($PSScriptRoot)
-$Manifest = Join-Path $Root 'Cargo.toml'
-$VendorRoot = Join-Path $Root 'vendor\idevice'
-$VendorMarker = Join-Path $VendorRoot '.iusbbridge-vendor'
-$VendorPatch = Join-Path $Root 'patches\idevice-compat.patch'
-$ExpectedVendorCommit = 'e98264c4194e6980173c576ac79a58adce95492b'
-$VendorRepository = 'https://github.com/jkcoxson/idevice.git'
-$Dist = Join-Path $Root 'dist'
-$Bridge = Join-Path $Dist 'iUsbBridge.exe'
-$RuntimeManifest = Join-Path $Dist 'iUsbBridge.runtime.json'
-
-function Invoke-Checked {
-    param(
-        [Parameter(Mandatory)][scriptblock]$Command,
-        [Parameter(Mandatory)][string]$FailureMessage
-    )
-
-    & $Command
-    if ($LASTEXITCODE -ne 0) {
-        throw "$FailureMessage Exit code: $LASTEXITCODE"
+$PythonDist = Join-Path $Root "dist"
+$PythonBuild = Join-Path $Root "build\python"
+$Out = Join-Path $PythonDist "iUsbBridge-Demo"
+$BridgeDirectory = Join-Path $PythonDist "iUsbBridge"
+$Bridge = Join-Path $BridgeDirectory "iUsbBridge.exe"
+$Spec = Join-Path $Root "iUsbBridge.spec"
+$Source = Join-Path $Root "src\usb_touch_bridge.py"
+$Requirements = Join-Path $Root "requirements.txt"
+if ([string]::IsNullOrWhiteSpace($EnvironmentPath)) {
+    $EnvironmentPath = Join-Path $Root "work\usb-touch-bridge-python"
+}
+$EnvironmentPath = [IO.Path]::GetFullPath($EnvironmentPath)
+$EnvironmentPython = Join-Path $EnvironmentPath "Scripts\python.exe"
+if ([string]::IsNullOrWhiteSpace($NativeDirectory)) {
+    $NativeDirectory = Join-Path $Root 'native'
+}
+$NativeDirectory = [IO.Path]::GetFullPath($NativeDirectory)
+# Use the same pinned Windows x64 backends as the iPhoneMirror Python build.
+# Native files are supplied by the caller and are never committed here.
+$nativeHashes = @{
+    'libusb0.dll' = '4F18B5D2C28AA66B648C8683C6D09B52B92CBBEE85984BBEFAD5F38A64BC2A14'
+    'libusb-1.0.dll' = '5072054CB3002AE071F382AD5C2C2B0092D9451C537D0C13444C2B6F968F7251'
+}
+foreach ($name in $nativeHashes.Keys) {
+    $nativePath = Join-Path $NativeDirectory $name
+    if (-not (Test-Path -LiteralPath $nativePath -PathType Leaf)) {
+        throw "Pinned USB backend is missing: $nativePath. Supply -NativeDirectory containing both x64 DLLs."
+    }
+    if ((Get-FileHash -LiteralPath $nativePath -Algorithm SHA256).Hash -ne $nativeHashes[$name]) {
+        throw "Pinned USB backend hash mismatch: $nativePath"
     }
 }
 
-function Initialize-IdeviceVendor {
-    if (Test-Path -LiteralPath $VendorMarker -PathType Leaf) {
-        $marker = (Get-Content -LiteralPath $VendorMarker -Raw).Trim()
-        if ($marker -eq $ExpectedVendorCommit -and
-            (Test-Path -LiteralPath (Join-Path $VendorRoot 'idevice\Cargo.toml') -PathType Leaf)) {
-            return
+foreach ($required in @($Spec, $Source, $Requirements)) {
+    if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+        throw "USB control build input is missing: $required"
+    }
+}
+
+function Write-BridgeRuntimeManifest([string]$Directory) {
+    $fullDirectory = [IO.Path]::GetFullPath($Directory).TrimEnd('\')
+    $manifestPath = Join-Path $fullDirectory 'iUsbBridge.runtime.json'
+    if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+        Remove-Item -LiteralPath $manifestPath -Force
+    }
+    $files = @(Get-ChildItem -LiteralPath $fullDirectory -Recurse -File |
+        Sort-Object FullName | ForEach-Object {
+            $relative = $_.FullName.Substring($fullDirectory.Length + 1) -replace '\\', '/'
+            [PSCustomObject][ordered]@{
+                path = $relative
+                sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+        })
+    if ($files.Count -eq 0 -or
+        @($files | Where-Object { $_.path -eq 'iUsbBridge.exe' }).Count -ne 1 -or
+        @($files | Where-Object { $_.path -like '_internal/*' }).Count -eq 0) {
+        throw 'PyInstaller onedir output does not contain the bridge and its runtime directory.'
+    }
+    $manifest = [PSCustomObject][ordered]@{
+        schema = 1
+        files = $files
+    }
+    [IO.File]::WriteAllText($manifestPath,
+        ($manifest | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
+}
+
+function Assert-SafeDirectory([string]$Path, [string]$ExpectedRoot) {
+    $fullPath = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $rootPath = [IO.Path]::GetFullPath($ExpectedRoot).TrimEnd('\')
+    if (-not $fullPath.StartsWith($rootPath + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing recursive mutation outside $rootPath`: $fullPath"
+    }
+    $ancestor = [IO.DirectoryInfo]::new($fullPath)
+    while ($null -ne $ancestor) {
+        if ($ancestor.Exists -and ($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Refusing recursive mutation through a reparse point: $($ancestor.FullName)"
         }
+        $ancestor = $ancestor.Parent
     }
-
-    if (Test-Path -LiteralPath $VendorRoot) {
-        throw "The generated vendor directory is incomplete or stale: $VendorRoot. Remove it and run the build again."
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return }
+    $directory = Get-Item -LiteralPath $Path -Force
+    if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing recursive mutation through a reparse point: $($directory.FullName)"
     }
-
-    $git = @(Get-Command git -CommandType Application -ErrorAction Stop |
-        Select-Object -First 1)[0]
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $VendorRoot) | Out-Null
-    Invoke-Checked -FailureMessage 'Failed to clone the idevice dependency.' -Command {
-        & $git.Source clone --filter=blob:none --no-checkout $VendorRepository $VendorRoot
+    $reparse = @(Get-ChildItem -LiteralPath $Path -Recurse -Force |
+        Where-Object {
+            ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+        })
+    if ($reparse.Count -ne 0) {
+        throw "Refusing recursive mutation through a reparse point: $($reparse[0].FullName)"
     }
-    Invoke-Checked -FailureMessage 'Failed to check out the pinned idevice dependency.' -Command {
-        & $git.Source -C $VendorRoot checkout --detach $ExpectedVendorCommit
-    }
-    Invoke-Checked -FailureMessage 'Failed to apply the iUsbBridge idevice compatibility patch.' -Command {
-        & $git.Source -C $VendorRoot apply --whitespace=nowarn $VendorPatch
-    }
-    [IO.File]::WriteAllText($VendorMarker, $ExpectedVendorCommit + [Environment]::NewLine,
-        [Text.UTF8Encoding]::new($false))
 }
 
-if (-not (Test-Path -LiteralPath $Manifest -PathType Leaf)) {
-    throw "Rust manifest is missing: $Manifest"
-}
-if (-not (Test-Path -LiteralPath $VendorPatch -PathType Leaf)) {
-    throw "idevice compatibility patch is missing: $VendorPatch"
-}
-
-Initialize-IdeviceVendor
-
-$cargo = @(Get-Command cargo -CommandType Application -ErrorAction Stop |
+$bootstrapPython = @(Get-Command $Python -CommandType Application -ErrorAction Stop |
     Select-Object -First 1)[0]
-if (-not $SkipTests) {
-    Invoke-Checked -FailureMessage 'iUsbBridge tests failed.' -Command {
-        & $cargo.Source test --locked --manifest-path $Manifest
+if (-not (Test-Path -LiteralPath $EnvironmentPython -PathType Leaf)) {
+    & $bootstrapPython.Source -m venv $EnvironmentPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to create USB touch bridge Python environment: $LASTEXITCODE"
     }
 }
-
-$cargoArguments = @('build', '--locked', '--manifest-path', $Manifest)
-if ($Configuration -eq 'Release') {
-    $cargoArguments += '--release'
-}
-Invoke-Checked -FailureMessage 'iUsbBridge build failed.' -Command {
-    & $cargo.Source @cargoArguments
+if (-not (Test-Path -LiteralPath $EnvironmentPython -PathType Leaf)) {
+    throw "USB touch bridge Python environment is incomplete: $EnvironmentPython"
 }
 
-$profileDirectory = if ($Configuration -eq 'Release') { 'release' } else { 'debug' }
-$builtBridge = Join-Path $Root "target\$profileDirectory\iphone-mirror-idevice-bridge.exe"
-if (-not (Test-Path -LiteralPath $builtBridge -PathType Leaf)) {
-    throw "Rust build output is missing: $builtBridge"
+& $EnvironmentPython -m pip install --disable-pip-version-check --requirement $Requirements
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to install USB touch bridge build requirements: $LASTEXITCODE"
 }
 
-New-Item -ItemType Directory -Force -Path $Dist | Out-Null
-Copy-Item -LiteralPath $builtBridge -Destination $Bridge -Force
-$hash = (Get-FileHash -LiteralPath $Bridge -Algorithm SHA256).Hash.ToLowerInvariant()
-$manifestObject = [ordered]@{
-    schema = 2
-    backend = 'idevice'
-    files = @([ordered]@{ path = 'iUsbBridge.exe'; sha256 = $hash })
-}
-[IO.File]::WriteAllText($RuntimeManifest,
-    ($manifestObject | ConvertTo-Json -Depth 4) + [Environment]::NewLine,
-    [Text.UTF8Encoding]::new($false))
+$previousNativeDirectory = $env:IUSBBRIDGE_NATIVE_DIRECTORY
+$env:IUSBBRIDGE_NATIVE_DIRECTORY = $NativeDirectory
+Push-Location $Root
+try {
+    Assert-SafeDirectory $BridgeDirectory $PythonDist
+    Assert-SafeDirectory $PythonBuild $Root
+    & $EnvironmentPython -m PyInstaller --noconfirm --clean --distpath $PythonDist --workpath $PythonBuild $Spec
+    if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed: $LASTEXITCODE" }
 
-if (-not [string]::IsNullOrWhiteSpace($BridgeOutputPath)) {
-    $BridgeOutputPath = [IO.Path]::GetFullPath($BridgeOutputPath)
-    $destinationDirectory = Split-Path -Parent $BridgeOutputPath
-    New-Item -ItemType Directory -Force -Path $destinationDirectory | Out-Null
-    Copy-Item -LiteralPath $Bridge -Destination $BridgeOutputPath -Force
-    Copy-Item -LiteralPath $RuntimeManifest `
-        -Destination (Join-Path $destinationDirectory 'iUsbBridge.runtime.json') -Force
-}
-
-if (-not $BridgeOnly) {
-    $demoOutput = Join-Path $Dist 'iUsbBridge-Demo'
-    if (Test-Path -LiteralPath $demoOutput) {
-        Remove-Item -LiteralPath $demoOutput -Recurse -Force
+    if (-not (Test-Path -LiteralPath $Bridge -PathType Leaf) -or
+        -not (Test-Path -LiteralPath (Join-Path $BridgeDirectory '_internal') -PathType Container)) {
+        throw "PyInstaller did not produce the USB touch bridge: $Bridge"
     }
-    Invoke-Checked -FailureMessage 'iUsbBridge demo build failed.' -Command {
-        dotnet publish (Join-Path $Root 'demo\iUsbBridgeDemo.csproj') `
-            -c $Configuration -r win-x64 --self-contained true -o $demoOutput
+    Write-BridgeRuntimeManifest $BridgeDirectory
+    $runtimeOutput = & $Bridge --check-runtime
+    if ($LASTEXITCODE -ne 0) { throw 'Packaged USB bridge runtime dependency check failed.' }
+    $runtimeReport = ($runtimeOutput -join "`n") | ConvertFrom-Json
+    if ($runtimeReport.runtime -ne 'ready' -or
+        'pymobiledevice3.services.cryptexd' -notin @($runtimeReport.modules) -or
+        'cryptex_owned_channels' -notin @($runtimeReport.functional_checks)) {
+        throw 'Packaged USB bridge is missing the required Cryptex lifecycle capability.'
     }
-    Copy-Item -LiteralPath $Bridge -Destination (Join-Path $demoOutput 'iUsbBridge.exe') -Force
-    Copy-Item -LiteralPath $RuntimeManifest `
-        -Destination (Join-Path $demoOutput 'iUsbBridge.runtime.json') -Force
-    Write-Host "iUsbBridge demo package: $demoOutput"
-}
+    Write-Output ($runtimeOutput -join "`n")
 
-Write-Host "iUsbBridge: $Bridge"
-Write-Host "SHA-256: $hash"
+    if (-not [string]::IsNullOrWhiteSpace($BridgeOutputPath)) {
+        $BridgeOutputPath = [IO.Path]::GetFullPath($BridgeOutputPath)
+        $destinationDirectory = Split-Path -Parent $BridgeOutputPath
+        $destinationRuntimeDirectory = Join-Path $destinationDirectory '_internal'
+        New-Item -ItemType Directory -Force -Path $destinationDirectory | Out-Null
+        if (Test-Path -LiteralPath $destinationRuntimeDirectory) {
+            Assert-SafeDirectory $destinationRuntimeDirectory $destinationDirectory
+            Remove-Item -LiteralPath $destinationRuntimeDirectory -Recurse -Force
+        }
+        Copy-Item -LiteralPath $Bridge -Destination $BridgeOutputPath -Force
+        Copy-Item -LiteralPath (Join-Path $BridgeDirectory '_internal') `
+            -Destination $destinationRuntimeDirectory -Recurse -Force
+        Copy-Item -LiteralPath (Join-Path $BridgeDirectory 'iUsbBridge.runtime.json') `
+            -Destination (Join-Path $destinationDirectory 'iUsbBridge.runtime.json') -Force
+    }
+
+    if ($BridgeOnly) {
+        Write-Host "USB touch bridge: $Bridge"
+        return
+    }
+
+    if (Test-Path -LiteralPath $Out) {
+        Assert-SafeDirectory $Out $PythonDist
+        Remove-Item -LiteralPath $Out -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path $Out | Out-Null
+    Get-ChildItem -LiteralPath $BridgeDirectory | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $Out -Recurse -Force
+    }
+
+    Push-Location (Join-Path $Root "demo")
+    try {
+        dotnet publish -c $Configuration -r win-x64 --self-contained true -o $Out
+        if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed: $LASTEXITCODE" }
+    }
+    finally { Pop-Location }
+
+    Write-Host "USB control package: $Out"
+}
+finally {
+    Pop-Location
+    if ($null -eq $previousNativeDirectory) {
+        Remove-Item Env:IUSBBRIDGE_NATIVE_DIRECTORY -ErrorAction SilentlyContinue
+    }
+    else { $env:IUSBBRIDGE_NATIVE_DIRECTORY = $previousNativeDirectory }
+}
