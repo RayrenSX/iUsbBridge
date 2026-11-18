@@ -119,6 +119,8 @@ USB 与无线会话均后台轮询剪贴板，每次 PULL/SET 使用独立连接
 
 `requestId` 必须是 32 位小写十六进制且当前未使用。失败返回稳定 `code`；用同一编号的 `cancel_hub` 取消操作。动作包括设备信息、应用与进程、文件/共享 Documents、描述文件、设置、位置、日志和电源命令。`restart_with_metal_hud` 只接受指定应用 bundle ID，使用固定 `MTL_HUD_ENABLED=1` 环境重启，不透传任意环境变量。
 
+Metal HUD 请求／响应、重启生命周期、35 秒动作契约与宿主责任见[Metal HUD 接入说明](METAL_HUD.md)。启动成功不保证浮层可见；普通 `launch` 不结束已有进程，因此不会清除仍运行进程的 HUD。
+
 请求排队、结果大小和期限均有界，恢复会取消旧操作。超时或取消不保证设备端写入尚未发生，客户端不应盲目重发安装、删除、启动或电源命令。字段定义见 [device_management.py](../src/device_management.py)。
 
 ## 7. DDI 准备

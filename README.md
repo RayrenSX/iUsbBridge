@@ -11,7 +11,7 @@ iUsbBridge 是面向 Windows 的独立 iPhone/iPad 控制桥接器。设备无�
 - Personalized / Cryptex DDI 准备、下载校验、超时与连接清理。
 - HID 会话健康检查、后台更新、输入与剪贴板恢复。
 - 设备管理 IPC：应用、进程、共享文档、文件操作、日志和设备设置。
-- 选定应用的 Metal HUD 重启请求，固定使用 `MTL_HUD_ENABLED=1`。
+- [选定应用的 Metal HUD 重启请求](docs/METAL_HUD.md)，固定使用 `MTL_HUD_ENABLED=1`。
 
 ## 系统要求
 
